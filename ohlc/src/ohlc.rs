@@ -29,6 +29,9 @@ impl OHLCMaker {
     ) {
         let tick_generator = TickGenerator::new();
         let tick_datas = tick_generator.from_file(&tick_path);
+        if tick_datas.is_empty() {
+            return;
+        }
         let ohlc_datas = make_batch_ohlc(&tick_datas, window_length, 0, tick_datas.len() - 1, 0);
 
         let mut out = std::fs::File::create(ohlc_path).expect("file creation failed");
@@ -55,8 +58,11 @@ impl OHLCMaker {
 
     pub fn make_ohlc_parallel(&self, tick_datas_r: Arc<RwLock<Vec<TickData>>>, window_length: u64) -> Vec<OHLCData>{
         let tick_datas = tick_datas_r.read().unwrap();
-        // make tick datas to splits
-        let split_count = num_cpus::get();
+        if tick_datas.is_empty() {
+            return Vec::new();
+        }
+        // make tick datas to splits; cap split count so no split has range_begin >= len
+        let split_count = num_cpus::get().min(tick_datas.len());
         let tick_data_splits = self.split_tick_data(&tick_datas, split_count, window_length);
         let ohlc_data_splits: Arc<Mutex<HashMap<u32, Vec<OHLCData>>>> = Arc::new(Mutex::new(HashMap::new()));
         let mut ohlc_datas: Vec<OHLCData> = Vec::with_capacity(tick_datas.len());
@@ -152,17 +158,30 @@ fn update_window(tick_datas: &Vec<TickData>, window: &mut OHLCWindow, cur_price:
     let begin_tick = &tick_datas[window.begin_index];  // it's safe to use index to fetch the data in vector.
     if cur_tick.T - begin_tick.T > window_length {
         // firstly, try update window begin pos to i-th
+        let mut found_new_begin = false;
         for i in window.begin_index + 1..cur_index + 1 {
             if tick_datas[i].s.eq(symbol) && cur_tick.T - tick_datas[i].T < window_length {
                 window.begin_index = i;
                 window.open = tick_datas[i].price.unwrap();
                 window.high = window.open;
                 window.low = window.open;
+                found_new_begin = true;
                 break;
             }
         }
-        // then, update high/low in range i-th to current tick
+        // all prior same-symbol ticks aged out: reset the window to current tick
+        if !found_new_begin {
+            window.begin_index = cur_index;
+            window.open = cur_price;
+            window.high = cur_price;
+            window.low = cur_price;
+            return;
+        }
+        // then, update high/low in range i-th to current tick (same symbol only)
         for i in window.begin_index + 1..cur_index + 1 {
+            if !tick_datas[i].s.eq(symbol) {
+                continue;
+            }
             let price = tick_datas[i].price.unwrap();
             if price > window.high {
                 window.high = price;
